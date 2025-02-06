@@ -38,4 +38,3 @@ jobs:
           git config --global user.name "jameshaworthcs/GitHub-Actions-Bot"
           git commit -m "Updated README" -a || echo "No changes to commit"
           git push
-
