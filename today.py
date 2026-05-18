@@ -6,8 +6,6 @@ from lxml import etree
 import time
 import hashlib
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, ProcessPoolExecutor
-import multiprocessing
 
 # Check if a .env.local file exists and load it so that its values get added to os.environ.
 if os.path.exists('.env.local'):
@@ -482,31 +480,6 @@ def formatter(query_type, difference, funct_return=False, whitespace=0):
     return funct_return
 
 
-def run_with_timeout(func, args=(), kwargs={}, timeout=5):
-    """
-    Runs a function in a separate process and returns its result.
-    If the function does not finish within `timeout` seconds,
-    the process is terminated and a TimeoutError is raised.
-    """
-    q = multiprocessing.Queue()
-
-    # Wrap the function so the result is put into a Queue.
-    def wrapper(q, *args, **kwargs):
-        result = func(*args, **kwargs)
-        q.put(result)
-
-    p = multiprocessing.Process(target=wrapper, args=(q,) + args, kwargs=kwargs)
-    p.start()
-    p.join(timeout)
-    if p.is_alive():
-        p.terminate()
-        p.join()
-        raise TimeoutError(f"{func.__name__} timed out after {timeout} seconds")
-    if not q.empty():
-        return q.get()
-    raise Exception("Function did not return any result")
-
-
 if __name__ == '__main__':
     """
     James Haworth (jameshaworthcs), 2017-2025
@@ -520,21 +493,10 @@ if __name__ == '__main__':
     age_data, age_time = perf_counter(daily_readme, datetime.datetime(2005, 8, 14))
     formatter('age calculation', age_time)
     
-    # Use run_with_timeout to call perf_counter(loc_query, ...) with a 5 second timeout.
-    try:
-        total_loc, loc_time = run_with_timeout(
-                                    lambda: perf_counter(loc_query,
-                                                         ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'],
-                                                         7,
-                                                         owner_id=OWNER_ID),
-                                    timeout=5)
-    except TimeoutError:
-        print("Error: LOC query timed out after 5 seconds")
-        total_loc, loc_time = [0, 0, 0, False], 0
-    except Exception as e:
-        print("Error occurred during LOC query:", e)
-        total_loc, loc_time = [0, 0, 0, False], 0
-        
+    total_loc, loc_time = perf_counter(loc_query,
+                                       ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'],
+                                       7,
+                                       owner_id=OWNER_ID)
     formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
     commit_data, commit_time = perf_counter(commit_counter, 7)
     star_data, star_time = perf_counter(graph_repos_stars, 'stars', ['OWNER'])
