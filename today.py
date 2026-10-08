@@ -62,6 +62,12 @@ def simple_request(func_name, query, variables):
         raise Exception(f"{func_name} request failed: {e}")
     
     if response.status_code == 200:
+        payload = response.json()
+        # GraphQL reports partial failures (e.g. a repository the token can't read) with a 200 and an errors list
+        if payload.get('errors'):
+            print(f"{func_name} returned GraphQL errors: {payload['errors']}")
+        if payload.get('data') is None:
+            raise Exception(f"{func_name} returned no data: {response.text} {QUERY_COUNT}")
         return response
     raise Exception(f"{func_name} has failed with status code {response.status_code}: {response.text} {QUERY_COUNT}")
 
@@ -175,7 +181,9 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
         raise Exception(f'recursive_loc() request failed: {e}')
     
     if response.status_code == 200:
-        repo_data = response.json()['data']['repository']
+        if response.json().get('errors'):
+            print(f"recursive_loc({owner}/{repo_name}) returned GraphQL errors: {response.json()['errors']}")
+        repo_data = (response.json().get('data') or {}).get('repository')
         if repo_data and repo_data['defaultBranchRef'] is not None:  # Only count commits if repo isn't empty
             return loc_counter_one_repo(
                 owner,
@@ -202,7 +210,7 @@ def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, additio
     only adds the LOC value of commits authored by me
     """
     for node in history['edges']:
-        if (node['node']['author']['user'] and 
+        if (node['node'] and node['node']['author'] and node['node']['author']['user'] and
             node['node']['author']['user'].get('id') == owner_id.get('id')):
             my_commits += 1
             addition_total += node['node']['additions']
@@ -250,52 +258,56 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
     }'''
     variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
     request = simple_request(loc_query.__name__, query, variables)
-    if request.json()['data']['user']['repositories']['pageInfo']['hasNextPage']:   # If repository data has another page
-        edges += request.json()['data']['user']['repositories']['edges']            # Add on to the LoC count
-        return loc_query(owner_affiliation, comment_size, force_cache, request.json()['data']['user']['repositories']['pageInfo']['endCursor'], edges, owner_id=owner_id)
+    repositories = request.json()['data']['user']['repositories']
+    edges = edges + [edge for edge in repositories['edges'] if edge and edge['node']]  # Skip repositories the token can't read
+    if repositories['pageInfo']['hasNextPage']:   # If repository data has another page
+        return loc_query(owner_affiliation, comment_size, force_cache, repositories['pageInfo']['endCursor'], edges, owner_id=owner_id)
     else:
-        return cache_builder(edges + request.json()['data']['user']['repositories']['edges'], comment_size, force_cache, owner_id=owner_id)
+        return cache_builder(edges, comment_size, force_cache, owner_id=owner_id)
 
 
 def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0, owner_id=None):
     """
     Checks each repository in edges to see if it has been updated since the last time it was cached
     If it has, run recursive_loc on that repository to update the LOC count
+    Cache lines are matched by repository hash, so adding or removing a repository only
+    recounts the repositories that changed instead of rebuilding the whole cache
     """
     cached = True # Assume all repositories are cached
     filename = 'cache/'+hashlib.sha256(USER_NAME.encode('utf-8')).hexdigest()+'.txt' # Create a unique filename for each user
     try:
         with open(filename, 'r') as f:
             data = f.readlines()
-    except FileNotFoundError: # If the cache file doesn't exist, create it
-        data = []
-        if comment_size > 0:
-            for _ in range(comment_size): data.append('This line is a comment block. Write whatever you want here.\n')
-        with open(filename, 'w') as f:
-            f.writelines(data)
-
-    if len(data)-comment_size != len(edges) or force_cache: # If the number of repos has changed, or force_cache is True
-        cached = False
-        flush_cache(edges, filename, comment_size)
-        with open(filename, 'r') as f:
-            data = f.readlines()
+    except FileNotFoundError: # If the cache file doesn't exist, start with just the comment block
+        data = ['This line is a comment block. Write whatever you want here.\n'] * comment_size
 
     cache_comment = data[:comment_size] # save the comment block
-    data = data[comment_size:] # remove those lines
+    known = {} # repo hash -> cached line
+    if not force_cache:
+        for line in data[comment_size:]:
+            if len(line.split()) == 5:
+                known[line.split()[0]] = line.rstrip('\n') + '\n'
+    data = []
+    for edge in edges: # new repositories start at zero and get counted below
+        repo_hash = hashlib.sha256(edge['node']['nameWithOwner'].encode('utf-8')).hexdigest()
+        data.append(known.get(repo_hash, repo_hash + ' 0 0 0 0\n'))
+    write_cache(filename, cache_comment, data) # drops repositories that no longer exist
+
     for index in range(len(edges)):
         repo_hash, commit_count, *__ = data[index].split()
-        if repo_hash == hashlib.sha256(edges[index]['node']['nameWithOwner'].encode('utf-8')).hexdigest():
-            try:
-                if int(commit_count) != edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']:
-                    # if commit count has changed, update loc for that repo
-                    owner, repo_name = edges[index]['node']['nameWithOwner'].split('/')
-                    loc = recursive_loc(owner, repo_name, data, cache_comment, owner_id=owner_id)
-                    data[index] = repo_hash + ' ' + str(edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
-            except TypeError: # If the repo is empty
-                data[index] = repo_hash + ' 0 0 0 0\n'
-    with open(filename, 'w') as f:
-        f.writelines(cache_comment)
-        f.writelines(data)
+        try:
+            if int(commit_count) != edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']:
+                # if commit count has changed, update loc for that repo
+                cached = False
+                owner, repo_name = edges[index]['node']['nameWithOwner'].split('/')
+                loc = recursive_loc(owner, repo_name, data, cache_comment, owner_id=owner_id)
+                if loc == 0: # repository couldn't be read, keep the old line
+                    continue
+                data[index] = repo_hash + ' ' + str(edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
+                write_cache(filename, cache_comment, data) # save progress so a timed-out run isn't wasted
+        except TypeError: # If the repo is empty
+            data[index] = repo_hash + ' 0 0 0 0\n'
+    write_cache(filename, cache_comment, data)
     for line in data:
         loc = line.split()
         loc_add += int(loc[3])
@@ -303,19 +315,13 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0, owner_
     return [loc_add, loc_del, loc_add - loc_del, cached]
 
 
-def flush_cache(edges, filename, comment_size):
+def write_cache(filename, cache_comment, data):
     """
-    Wipes the cache file
-    This is called when the number of repositories changes or when the file is first created
+    Writes the comment block and repository lines to the cache file
     """
-    with open(filename, 'r') as f:
-        data = []
-        if comment_size > 0:
-            data = f.readlines()[:comment_size] # only save the comment
     with open(filename, 'w') as f:
+        f.writelines(cache_comment)
         f.writelines(data)
-        for node in edges:
-            f.write(hashlib.sha256(node['node']['nameWithOwner'].encode('utf-8')).hexdigest() + ' 0 0 0 0\n')
 
 
 def add_archive():
@@ -354,7 +360,9 @@ def stars_counter(data):
     Count total stars in repositories owned by me
     """
     total_stars = 0
-    for node in data: total_stars += node['node']['stargazers']['totalCount']
+    for node in data:
+        if node and node['node']:  # Skip repositories the token can't read
+            total_stars += node['node']['stargazers']['totalCount']
     return total_stars
 
 
